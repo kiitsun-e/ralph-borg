@@ -1,5 +1,9 @@
 # ralph-borg
 
+<p align="center">
+  <img src="ralph-borg.jpg" alt="ralph-borg" width="600">
+</p>
+
 Spec-driven development with parallel agent orchestration for Claude Code.
 
 > "Resistance is futile. Your specs will be assimilated."
