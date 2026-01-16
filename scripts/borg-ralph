@@ -203,10 +203,11 @@ cmd_loop() {
 
         # Build agent-driven prompt (Traditional Ralph Loop)
         # Agent decides what to pick up, not the orchestrator
+        # Use relative path so agent reads from its own slot, not original repo
         local prompt="You are continuing implementation work on a feature.
 
 ## Context Files (Read in this order)
-1. **Implementation Plan:** ${impl_plan}
+1. **Implementation Plan:** ${impl_plan_relative}
    - This has checkboxes [ ] for incomplete tasks and [x] for done
    - Look at the **Spec:** link at the top for the feature spec
 2. **Feature Spec:** Check the implementation plan header for the link
