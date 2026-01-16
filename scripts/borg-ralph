@@ -230,12 +230,38 @@ cmd_loop() {
 ## Rules
 - **STOP after 2-3 tasks** - do not continue even if you have capacity
 - Update checkboxes IMMEDIATELY as you complete each task
-- Commit after completing your tasks
 - Reference the feature spec for detailed requirements
 - If unclear, check SPEC.md for broader context
 - Trust that another agent will pick up remaining work
 
-Begin by reading the implementation plan, pick 2-3 tasks, complete them, commit, and exit."
+## Quality Standards (MANDATORY)
+
+### When Writing Code
+- **Write tests** for new functionality (unit tests at minimum)
+- **Add types** where the language supports it
+- **Follow existing patterns** in the codebase
+
+### First Agent Only (if project is new/empty)
+If build/lint/test tooling doesn't exist, set it up:
+- Add linter config (ESLint, Prettier, clippy, golangci-lint, etc.)
+- Add test framework (Jest, Vitest, pytest, go test, etc.)
+- Add build script if needed
+- Add pre-commit hooks if appropriate
+
+### Before Every Commit
+Run these checks and fix any failures:
+
+1. **Build**: npm run build, cargo build, go build, etc.
+2. **Lint**: npm run lint, cargo clippy, golangci-lint, etc.
+3. **Tests**: npm test, cargo test, go test, pytest, etc.
+4. **Type Check**: tsc --noEmit, mypy, etc.
+
+If ANY check fails:
+- Fix the issue
+- Re-run checks until they pass
+- Then commit
+
+Begin by reading the implementation plan, pick 2-3 tasks, complete them, write tests, verify with checks, commit, and exit."
 
         # Clean previous run if exists
         if [[ -f "${BORG_HOME}/state/${slot_name}.json" ]]; then
@@ -393,10 +419,34 @@ cmd_spawn() {
 ## Your Task
 
 1. Read the implementation plan to see what's incomplete
-2. Pick a reasonable chunk of work you can complete
+2. Pick **exactly 2-3 tasks** to complete - NO MORE
 3. Do the work, referencing the feature spec for requirements
 4. Update each checkbox from [ ] to [x] as you complete it
-5. Commit your changes with a descriptive message
+5. Run verification checks (see below)
+6. Commit your changes with a descriptive message
+7. **EXIT IMMEDIATELY** after completing your 2-3 tasks
+
+## Quality Standards (MANDATORY)
+
+### When Writing Code
+- **Write tests** for new functionality (unit tests at minimum)
+- **Add types** where the language supports it
+- **Follow existing patterns** in the codebase
+
+### First Agent Only (if project is new/empty)
+If build/lint/test tooling doesn't exist, set it up:
+- Add linter config (ESLint, Prettier, clippy, golangci-lint, etc.)
+- Add test framework (Jest, Vitest, pytest, go test, etc.)
+- Add build script if needed
+
+### Before Every Commit
+Run these checks and fix any failures:
+1. **Build**: npm run build, cargo build, go build, etc.
+2. **Lint**: npm run lint, cargo clippy, golangci-lint, etc.
+3. **Tests**: npm test, cargo test, go test, pytest, etc.
+4. **Type Check**: tsc --noEmit, mypy, etc.
+
+If ANY check fails, fix and re-run until they pass.
 
 Begin by reading the implementation plan."
 
