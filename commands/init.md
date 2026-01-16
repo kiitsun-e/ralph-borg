@@ -175,7 +175,11 @@ borg init .
 
 This sets up the isolated agent workspace and stores the current repo path so branches can be pushed back when features complete.
 
-If `borg` is not found, inform the user they need to add the ralph-borg scripts to their PATH.
+If `borg` is not found, inform the user:
+
+```
+borg command not found. Run /ralph-borg:borg-setup to configure your terminal PATH.
+```
 
 ### Step 7: Output Summary
 
