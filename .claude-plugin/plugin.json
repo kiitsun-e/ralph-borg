@@ -2,7 +2,9 @@
   "name": "ralph-borg",
   "version": "0.1.0",
   "description": "Spec-driven development with parallel agent orchestration",
-  "author": "kiitsun-e",
+  "author": {
+    "name": "kiitsun-e"
+  },
   "license": "MIT",
   "repository": "https://github.com/kiitsun-e/ralph-borg",
   "hooks": "./hooks/hooks.json",
