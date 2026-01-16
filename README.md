@@ -36,6 +36,15 @@ git init
 
 Scripts are automatically available after installation - no PATH setup needed.
 
+### Updating
+
+To get the latest version:
+
+```bash
+/plugin marketplace update ralph-borg
+/plugin update ralph-borg
+```
+
 ### Option 2: Manual Installation
 
 Clone the repository:
