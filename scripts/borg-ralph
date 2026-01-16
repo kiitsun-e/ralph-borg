@@ -166,6 +166,14 @@ cmd_loop() {
     local iteration=0
     local total_cost=0
 
+    # Get the relative path of impl_plan from repo root for checking in slot
+    local original_repo_root=""
+    if [[ -f "${BORG_HOME}/config.json" ]]; then
+        original_repo_root=$(grep -o '"original_repo_path": *"[^"]*"' "${BORG_HOME}/config.json" 2>/dev/null | cut -d'"' -f4 || echo "")
+    fi
+    local impl_plan_relative="${impl_plan#$original_repo_root/}"
+    local slot_impl_plan="${BORG_HOME}/slots/${slot_name}/${impl_plan_relative}"
+
     while true; do
         iteration=$((iteration + 1))
 
@@ -174,9 +182,14 @@ cmd_loop() {
             exit 1
         fi
 
-        # Find next incomplete phase
+        # Find next incomplete phase - check slot's copy after first iteration
+        local check_plan="$impl_plan"
+        if [[ $iteration -gt 1 && -f "$slot_impl_plan" ]]; then
+            check_plan="$slot_impl_plan"
+        fi
+
         local phase_info
-        if ! phase_info=$(find_next_phase "$impl_plan"); then
+        if ! phase_info=$(find_next_phase "$check_plan"); then
             log_success "All phases complete!"
             break
         fi
@@ -255,8 +268,18 @@ Begin by reading the implementation plan to see what needs to be done."
             log_info "Phase ${phase_num} cost: \$${phase_cost}"
         fi
 
-        # Check if checkboxes were updated
-        local remaining=$(count_unchecked "$impl_plan")
+        # Sync implementation plan back to original repo for visibility
+        if [[ -f "$slot_impl_plan" && -n "$original_repo_root" ]]; then
+            cp "$slot_impl_plan" "$impl_plan"
+            log_info "Synced progress back to original repo"
+        fi
+
+        # Check if checkboxes were updated - use slot's copy
+        local remaining_plan="$impl_plan"
+        if [[ -f "$slot_impl_plan" ]]; then
+            remaining_plan="$slot_impl_plan"
+        fi
+        local remaining=$(count_unchecked "$remaining_plan")
         log_info "Remaining unchecked tasks: ${remaining}"
 
         # Small delay before next iteration
