@@ -9,7 +9,7 @@
       "name": "ralph-borg",
       "source": "./",
       "description": "Spec-driven development with parallel agent orchestration",
-      "version": "0.2.5"
+      "version": "0.2.6"
     }
   ]
 }
