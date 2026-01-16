@@ -38,7 +38,7 @@ git init
 /plugin install ralph-borg
 ```
 
-Scripts are automatically available after installation - no PATH setup needed.
+Scripts are automatically available within Claude Code sessions. To run `borg` commands directly in your terminal, run `/ralph-borg:borg-setup` and follow the instructions.
 
 ### Updating
 
@@ -63,7 +63,7 @@ Use the plugin with Claude Code:
 claude --plugin-dir ~/.claude/plugins/ralph-borg
 ```
 
-Scripts are automatically added to PATH when the plugin loads.
+Scripts are automatically added to PATH within Claude Code sessions. For terminal usage, run `/ralph-borg:borg-setup`.
 
 ### Option 3: Development Mode
 
@@ -200,6 +200,16 @@ Show progress of all feature implementations.
 /ralph-borg:status <feature-name>  # Detailed view
 ```
 
+### /ralph-borg:borg-setup
+
+Display instructions for adding borg scripts to your terminal PATH.
+
+```bash
+/ralph-borg:borg-setup
+```
+
+Use this if you want to run `borg` or `borg-ralph` commands directly in your terminal (outside of Claude Code).
+
 ## How It Works
 
 ```
@@ -291,7 +301,8 @@ ralph-borg/
 │   ├── init.md              # Initialize project
 │   ├── feature.md           # Create feature spec
 │   ├── implement.md         # Run implementation loop
-│   └── status.md            # Show progress
+│   ├── status.md            # Show progress
+│   └── borg-setup.md        # Terminal PATH setup
 ├── hooks/
 │   └── hooks.json           # SessionStart hook for PATH setup
 ├── skills/
@@ -311,6 +322,16 @@ ralph-borg/
 | `BORG_PHASE_TIMEOUT` | `600` | Timeout per phase (seconds) |
 
 ## Troubleshooting
+
+### borg command not found
+
+If you get "borg command not found" in your terminal:
+
+```bash
+/ralph-borg:borg-setup  # Run in Claude Code, follow the instructions
+```
+
+This adds the scripts to your shell PATH. Note: Within Claude Code sessions, the PATH is configured automatically.
 
 ### Agent seems stuck
 
