@@ -7,7 +7,6 @@
   },
   "license": "MIT",
   "repository": "https://github.com/kiitsun-e/ralph-borg",
-  "hooks": "./hooks/hooks.json",
   "keywords": [
     "ralph-loop",
     "spec-driven",
