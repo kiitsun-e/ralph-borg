@@ -1,0 +1,591 @@
+#!/usr/bin/env bash
+#
+# borg-ralph - Ralph Loop wrapper for Borg multi-agent system
+#
+# Orchestrates iterative development using the Ralph Loop methodology:
+# - Parses implementation plan to find incomplete phases
+# - Spawns a fresh agent for each phase (true session-per-phase)
+# - Monitors completion, then re-spawns for next phase
+# - Continues until all phases complete
+#
+# Usage: borg-ralph loop <slot> <implementation-plan.md>
+#
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BORG_HOME="${BORG_HOME:-$HOME/.borg}"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+log_info()    { echo -e "${BLUE}[borg-ralph]${NC} $1"; }
+log_success() { echo -e "${GREEN}[borg-ralph]${NC} $1"; }
+log_warn()    { echo -e "${YELLOW}[borg-ralph]${NC} $1"; }
+log_error()   { echo -e "${RED}[borg-ralph]${NC} $1" >&2; }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Plan Parsing Functions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Count unchecked tasks in implementation plan
+count_unchecked() {
+    local impl_plan="$1"
+    grep -c '^\s*- \[ \]' "$impl_plan" 2>/dev/null || echo "0"
+}
+
+# Find next incomplete phase (returns phase number and title, or empty if done)
+find_next_phase() {
+    local impl_plan="$1"
+    local in_phase="" phase_num="" phase_title="" has_unchecked=false
+
+    while IFS= read -r line; do
+        # Check for phase header
+        if [[ "$line" =~ ^##[[:space:]]+Phase[[:space:]]+([0-9]+):?[[:space:]]*(.*) ]]; then
+            # If we were in a phase with unchecked items, return it
+            if [[ "$has_unchecked" == true ]]; then
+                echo "$phase_num|$phase_title"
+                return 0
+            fi
+            phase_num="${BASH_REMATCH[1]}"
+            phase_title="${BASH_REMATCH[2]}"
+            has_unchecked=false
+        fi
+        # Check for unchecked task
+        if [[ "$line" =~ ^[[:space:]]*-[[:space:]]\[[[:space:]]\] ]]; then
+            has_unchecked=true
+        fi
+    done < "$impl_plan"
+
+    # Check last phase
+    if [[ "$has_unchecked" == true ]]; then
+        echo "$phase_num|$phase_title"
+        return 0
+    fi
+
+    return 1  # All phases complete
+}
+
+# Get content of a specific phase
+get_phase_content() {
+    local impl_plan="$1" target_phase="$2"
+    local in_phase=false output=""
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^##[[:space:]]+Phase[[:space:]]+([0-9]+) ]]; then
+            if [[ "${BASH_REMATCH[1]}" == "$target_phase" ]]; then
+                in_phase=true
+            elif [[ "$in_phase" == true ]]; then
+                break
+            fi
+        fi
+        if [[ "$in_phase" == true ]]; then
+            output+="$line"$'\n'
+        fi
+    done < "$impl_plan"
+
+    echo "$output"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Agent Monitoring
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Wait for agent to complete
+wait_for_completion() {
+    local slot_name="$1" timeout="${2:-600}"
+    local state_file="${BORG_HOME}/state/${slot_name}.json"
+    local start_time=$(date +%s)
+
+    while true; do
+        if [[ ! -f "$state_file" ]]; then
+            log_error "State file not found: $state_file"
+            return 1
+        fi
+
+        local pid=$(grep -o '"pid": *[0-9]*' "$state_file" 2>/dev/null | grep -oE '[0-9]+' || echo "")
+
+        if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+            return 0  # Agent finished
+        fi
+
+        local elapsed=$(( $(date +%s) - start_time ))
+        if [[ $elapsed -ge $timeout ]]; then
+            log_warn "Timeout after ${timeout}s"
+            return 2
+        fi
+
+        sleep 2
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Command: loop (the main orchestration command)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cmd_loop() {
+    local slot_name="" impl_plan="" model="" max_phases=20
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --model) model="$2"; shift 2 ;;
+            --max-phases) max_phases="$2"; shift 2 ;;
+            -h|--help) cmd_help loop; return ;;
+            *)
+                if [[ -z "$slot_name" ]]; then slot_name="$1"
+                elif [[ -z "$impl_plan" ]]; then impl_plan="$1"
+                else log_error "Unexpected argument: $1"; cmd_help loop; return
+                fi
+                shift ;;
+        esac
+    done
+
+    if [[ -z "$slot_name" || -z "$impl_plan" ]]; then
+        cmd_help loop
+        return
+    fi
+
+    # Resolve to absolute path
+    if [[ ! "$impl_plan" = /* ]]; then
+        impl_plan="$(pwd)/$impl_plan"
+    fi
+
+    if [[ ! -f "$impl_plan" ]]; then
+        log_error "Implementation plan not found: $impl_plan"
+        exit 1
+    fi
+
+    log_info "Starting Ralph Loop for '${slot_name}'"
+    log_info "Implementation plan: ${impl_plan}"
+
+    local iteration=0
+    local total_cost=0
+
+    while true; do
+        iteration=$((iteration + 1))
+
+        if [[ $iteration -gt $max_phases ]]; then
+            log_error "Max phases ($max_phases) exceeded"
+            exit 1
+        fi
+
+        # Find next incomplete phase
+        local phase_info
+        if ! phase_info=$(find_next_phase "$impl_plan"); then
+            log_success "All phases complete!"
+            break
+        fi
+
+        local phase_num="${phase_info%%|*}"
+        local phase_title="${phase_info#*|}"
+
+        log_info "═══════════════════════════════════════════════════════"
+        log_info "Phase ${phase_num}: ${phase_title}"
+        log_info "═══════════════════════════════════════════════════════"
+
+        # Build agent-driven prompt (Traditional Ralph Loop)
+        # Agent decides what to pick up, not the orchestrator
+        local prompt="You are continuing implementation work on a feature.
+
+## Context Files (Read in this order)
+1. **Implementation Plan:** ${impl_plan}
+   - This has checkboxes [ ] for incomplete tasks and [x] for done
+   - Look at the **Spec:** link at the top for the feature spec
+2. **Feature Spec:** Check the implementation plan header for the link
+   - This has the detailed requirements and decisions
+3. **Main SPEC.md:** specs/SPEC.md if you need broader product context
+4. **CLAUDE.md:** For project patterns and conventions
+
+## Your Task
+
+1. Read the implementation plan to see what's incomplete ([ ] checkboxes)
+2. Pick a reasonable chunk of work you can complete WITHOUT filling your context
+   - Don't try to do everything at once
+   - Better to do 2-3 tasks well than rush through many
+3. Do the work, referencing the feature spec for requirements
+4. Update each checkbox from [ ] to [x] as you complete it
+5. Commit your changes with a descriptive message
+6. Exit when you've completed your chunk (another agent will continue)
+
+## Rules
+- Update checkboxes IMMEDIATELY as you complete each task
+- Commit after completing your chunk of work
+- Don't try to do too much - stay well under context limits
+- Reference the feature spec for detailed requirements
+- If unclear, check SPEC.md for broader context
+
+Begin by reading the implementation plan to see what needs to be done."
+
+        # Clean previous run if exists
+        if [[ -f "${BORG_HOME}/state/${slot_name}.json" ]]; then
+            local old_pid=$(grep -o '"pid": *[0-9]*' "${BORG_HOME}/state/${slot_name}.json" 2>/dev/null | grep -oE '[0-9]+' || echo "")
+            if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+                log_warn "Previous agent still running, waiting..."
+                wait_for_completion "$slot_name" 60
+            fi
+        fi
+
+        # Spawn agent for this phase
+        log_info "Spawning agent for Phase ${phase_num}..."
+
+        local borg_args=(spawn "$slot_name" "$prompt" --commit)
+        [[ -n "$model" ]] && borg_args+=(--model "$model")
+
+        # Use --continue for subsequent phases to preserve previous work
+        if [[ $iteration -gt 1 ]]; then
+            borg_args+=(--continue)
+        fi
+
+        "${SCRIPT_DIR}/borg" "${borg_args[@]}"
+
+        # Wait for completion
+        log_info "Waiting for Phase ${phase_num} to complete..."
+        wait_for_completion "$slot_name" 600
+
+        # Get cost from this iteration
+        local log_file="${BORG_HOME}/logs/${slot_name}.log"
+        if [[ -f "$log_file" ]]; then
+            local phase_cost=$(grep -o '"total_cost_usd":[0-9.]*' "$log_file" 2>/dev/null | tail -1 | grep -oE '[0-9.]+' || echo "0")
+            total_cost=$(echo "$total_cost + $phase_cost" | bc 2>/dev/null || echo "$total_cost")
+            log_info "Phase ${phase_num} cost: \$${phase_cost}"
+        fi
+
+        # Check if checkboxes were updated
+        local remaining=$(count_unchecked "$impl_plan")
+        log_info "Remaining unchecked tasks: ${remaining}"
+
+        # Small delay before next iteration
+        sleep 2
+    done
+
+    log_success "═══════════════════════════════════════════════════════"
+    log_success "Ralph Loop complete!"
+    log_success "Total iterations: ${iteration}"
+    log_success "Total cost: \$${total_cost}"
+    log_success "═══════════════════════════════════════════════════════"
+
+    # Push branch to original repo if configured
+    local original_repo_path=""
+    if [[ -f "${BORG_HOME}/config.json" ]]; then
+        original_repo_path=$(grep -o '"original_repo_path": *"[^"]*"' "${BORG_HOME}/config.json" 2>/dev/null | cut -d'"' -f4 || echo "")
+    fi
+
+    local slot_path="${BORG_HOME}/slots/${slot_name}"
+    local branch_name="borg/${slot_name}"
+
+    if [[ -n "$original_repo_path" && -d "$original_repo_path/.git" ]]; then
+        log_info ""
+        log_info "Pushing branch to original repo..."
+        if cd "$slot_path" && git push original "${branch_name}:${branch_name}" 2>/dev/null; then
+            log_success "Branch '${branch_name}' pushed to original repo!"
+            log_info ""
+            log_info "In your original repo, you can now:"
+            log_info "  git branch                    # See the new branch"
+            log_info "  git checkout ${branch_name}  # Switch to it"
+            log_info "  git merge ${branch_name}     # Merge to main"
+            log_info "  git push origin ${branch_name}  # Push to GitHub for PR"
+        else
+            log_warn "Could not push to original repo. Push manually:"
+            log_info "  cd ${slot_path} && git push original ${branch_name}"
+        fi
+    else
+        log_info ""
+        log_info "Review changes: ./borg diff ${slot_name}"
+        log_info "Merge: ./borg merge ${slot_name} --pr"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Command: spawn (single phase, for manual use)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cmd_spawn() {
+    local slot_name="" impl_plan="" model=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --model) model="$2"; shift 2 ;;
+            -h|--help) cmd_help spawn; return ;;
+            *)
+                if [[ -z "$slot_name" ]]; then slot_name="$1"
+                elif [[ -z "$impl_plan" ]]; then impl_plan="$1"
+                else log_error "Unexpected argument: $1"; cmd_help spawn; return
+                fi
+                shift ;;
+        esac
+    done
+
+    if [[ -z "$slot_name" || -z "$impl_plan" ]]; then
+        cmd_help spawn
+        return
+    fi
+
+    # Resolve to absolute path
+    if [[ ! "$impl_plan" = /* ]]; then
+        impl_plan="$(pwd)/$impl_plan"
+    fi
+
+    if [[ ! -f "$impl_plan" ]]; then
+        log_error "Implementation plan not found: $impl_plan"
+        exit 1
+    fi
+
+    # Find next phase
+    local phase_info
+    if ! phase_info=$(find_next_phase "$impl_plan"); then
+        log_success "All phases already complete!"
+        return 0
+    fi
+
+    local phase_num="${phase_info%%|*}"
+    local phase_title="${phase_info#*|}"
+
+    log_info "Spawning for Phase ${phase_num}: ${phase_title}"
+    log_info "Implementation plan: ${impl_plan}"
+
+    # Build agent-driven prompt (Traditional Ralph Loop)
+    local prompt="You are continuing implementation work on a feature.
+
+## Context Files (Read in this order)
+1. **Implementation Plan:** ${impl_plan}
+   - This has checkboxes [ ] for incomplete tasks and [x] for done
+   - Look at the **Spec:** link at the top for the feature spec
+2. **Feature Spec:** Check the implementation plan header for the link
+3. **Main SPEC.md:** specs/SPEC.md if you need broader product context
+4. **CLAUDE.md:** For project patterns and conventions
+
+## Your Task
+
+1. Read the implementation plan to see what's incomplete
+2. Pick a reasonable chunk of work you can complete
+3. Do the work, referencing the feature spec for requirements
+4. Update each checkbox from [ ] to [x] as you complete it
+5. Commit your changes with a descriptive message
+
+Begin by reading the implementation plan."
+
+    local borg_args=(spawn "$slot_name" "$prompt" --commit)
+    [[ -n "$model" ]] && borg_args+=(--model "$model")
+
+    "${SCRIPT_DIR}/borg" "${borg_args[@]}"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Command: status
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cmd_status() {
+    local impl_plan="${1:-}"
+
+    if [[ -z "$impl_plan" ]]; then
+        echo "Usage: borg-ralph status <implementation-plan.md>"
+        return 1
+    fi
+
+    if [[ ! "$impl_plan" = /* ]]; then
+        impl_plan="$(pwd)/$impl_plan"
+    fi
+
+    if [[ ! -f "$impl_plan" ]]; then
+        log_error "Implementation plan not found: $impl_plan"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${CYAN}Implementation Plan Status${NC}"
+    echo "═══════════════════════════════════════════════════════"
+    echo ""
+
+    local total_phases=0 complete_phases=0
+    local current_phase="" phase_tasks=0 phase_done=0
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^##[[:space:]]+Phase[[:space:]]+([0-9]+):?[[:space:]]*(.*) ]]; then
+            # Print previous phase summary
+            if [[ -n "$current_phase" ]]; then
+                if [[ $phase_done -eq $phase_tasks && $phase_tasks -gt 0 ]]; then
+                    echo -e "  [${GREEN}x${NC}] Phase ${current_phase} (${phase_done}/${phase_tasks})"
+                    complete_phases=$((complete_phases + 1))
+                elif [[ $phase_done -gt 0 ]]; then
+                    echo -e "  [${YELLOW}~${NC}] Phase ${current_phase} (${phase_done}/${phase_tasks})"
+                else
+                    echo -e "  [ ] Phase ${current_phase} (${phase_done}/${phase_tasks})"
+                fi
+            fi
+
+            current_phase="${BASH_REMATCH[1]}: ${BASH_REMATCH[2]}"
+            total_phases=$((total_phases + 1))
+            phase_tasks=0
+            phase_done=0
+        elif [[ "$line" =~ ^[[:space:]]*-[[:space:]]\[x\] ]]; then
+            phase_tasks=$((phase_tasks + 1))
+            phase_done=$((phase_done + 1))
+        elif [[ "$line" =~ ^[[:space:]]*-[[:space:]]\[[[:space:]]\] ]]; then
+            phase_tasks=$((phase_tasks + 1))
+        fi
+    done < "$impl_plan"
+
+    # Print last phase
+    if [[ -n "$current_phase" ]]; then
+        if [[ $phase_done -eq $phase_tasks && $phase_tasks -gt 0 ]]; then
+            echo -e "  [${GREEN}x${NC}] Phase ${current_phase} (${phase_done}/${phase_tasks})"
+            complete_phases=$((complete_phases + 1))
+        elif [[ $phase_done -gt 0 ]]; then
+            echo -e "  [${YELLOW}~${NC}] Phase ${current_phase} (${phase_done}/${phase_tasks})"
+        else
+            echo -e "  [ ] Phase ${current_phase} (${phase_done}/${phase_tasks})"
+        fi
+    fi
+
+    echo ""
+    echo "═══════════════════════════════════════════════════════"
+    echo -e "Progress: ${complete_phases}/${total_phases} phases complete"
+    echo ""
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Command: help
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cmd_help() {
+    local command="${1:-}"
+
+    case "$command" in
+        loop)
+            cat << 'EOF'
+borg-ralph loop - Run full Ralph Loop until all phases complete
+
+USAGE:
+    borg-ralph loop <slot> <implementation-plan.md> [options]
+
+ARGUMENTS:
+    slot                    Name for the agent slot
+    implementation-plan     Path to markdown file with phased tasks
+
+OPTIONS:
+    --model <model>         Claude model to use (default: sonnet)
+    --max-phases <n>        Maximum phases to run (default: 20)
+    -h, --help              Show this help
+
+DESCRIPTION:
+    Orchestrates the full Ralph Loop:
+
+    1. Parses implementation plan to find next incomplete phase
+    2. Spawns a fresh agent to work on ONLY that phase
+    3. Waits for agent to complete and commit
+    4. Repeats with next phase (fresh context each time)
+    5. Stops when all phases show [x] checkboxes
+
+    Each phase gets a fresh agent with no memory of previous phases.
+    The checkboxes in the implementation plan are the persistent state.
+
+EXAMPLES:
+    # Run full loop for auth feature
+    borg-ralph loop auth specs/auth.implementation.md
+
+    # Use opus model
+    borg-ralph loop auth specs/auth.implementation.md --model opus
+EOF
+            ;;
+        spawn)
+            cat << 'EOF'
+borg-ralph spawn - Spawn agent for next incomplete phase
+
+USAGE:
+    borg-ralph spawn <slot> <implementation-plan.md> [options]
+
+ARGUMENTS:
+    slot                    Name for the agent slot
+    implementation-plan     Path to markdown file with phased tasks
+
+OPTIONS:
+    --model <model>         Claude model to use (default: sonnet)
+    -h, --help              Show this help
+
+DESCRIPTION:
+    Spawns a single agent to work on the next incomplete phase.
+    Use this for manual phase-by-phase control.
+
+    For automated looping, use 'borg-ralph loop' instead.
+
+EXAMPLES:
+    # Spawn for next incomplete phase
+    borg-ralph spawn auth specs/auth.implementation.md
+EOF
+            ;;
+        status)
+            cat << 'EOF'
+borg-ralph status - Show implementation plan progress
+
+USAGE:
+    borg-ralph status <implementation-plan.md>
+
+DESCRIPTION:
+    Displays checkbox progress for each phase in the implementation plan.
+EOF
+            ;;
+        *)
+            cat << 'EOF'
+borg-ralph - Ralph Loop orchestration for Borg
+
+USAGE:
+    borg-ralph <command> [arguments]
+
+COMMANDS:
+    loop        Run full Ralph Loop (recommended)
+    spawn       Spawn agent for single phase
+    status      Show implementation plan progress
+    help        Show help for a command
+
+DESCRIPTION:
+    borg-ralph orchestrates iterative development using the Ralph Loop:
+
+    - Each phase runs as a FRESH agent (true session-per-phase)
+    - Checkboxes in the implementation plan persist across sessions
+    - The orchestrator manages the loop, not the agent
+
+WORKFLOW:
+    1. Create implementation plan with phases and checkboxes
+    2. Run: borg-ralph loop <slot> <plan.md>
+    3. Monitor: borg status --watch
+    4. When complete: borg merge <slot> --pr
+
+EXAMPLE PLAN FORMAT:
+    ## Phase 1: Setup
+    - [ ] Create directory
+    - [ ] Add config file
+
+    ## Phase 2: Implementation
+    - [ ] Build feature
+    - [ ] Add tests
+
+For command details:
+    borg-ralph help <command>
+EOF
+            ;;
+    esac
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════════════
+
+main() {
+    local command="${1:-help}"
+    shift || true
+
+    case "$command" in
+        loop)   cmd_loop "$@" ;;
+        spawn)  cmd_spawn "$@" ;;
+        status) cmd_status "$@" ;;
+        help|--help|-h) cmd_help "$@" ;;
+        *) log_error "Unknown command: $command"; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"

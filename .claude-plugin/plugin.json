@@ -1,0 +1,17 @@
+{
+  "name": "ralph-borg",
+  "version": "0.1.0",
+  "description": "Spec-driven development with parallel agent orchestration",
+  "author": "kiitsun-e",
+  "license": "MIT",
+  "repository": "https://github.com/kiitsun-e/ralph-borg",
+  "hooks": "./hooks/hooks.json",
+  "keywords": [
+    "ralph-loop",
+    "spec-driven",
+    "multi-agent",
+    "orchestration",
+    "claude-code",
+    "parallel-agents"
+  ]
+}

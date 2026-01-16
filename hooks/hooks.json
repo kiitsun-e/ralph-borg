@@ -1,0 +1,16 @@
+{
+  "description": "ralph-borg plugin hooks - auto-configure PATH for borg scripts",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/setup-path.sh ${CLAUDE_PLUGIN_ROOT}",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

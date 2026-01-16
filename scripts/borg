@@ -1,0 +1,932 @@
+#!/usr/bin/env bash
+#
+# borg - Multi-Agent Checkout System
+#
+# "Resistance is futile. Your tasks will be assimilated."
+#
+# Usage: borg <command> [options]
+#
+# Commands:
+#   init     Initialize workspace with reference clone
+#   spawn    Spawn an agent in an isolated checkout
+#   status   Show status of all agents
+#   logs     Tail logs for an agent
+#   diff     Show changes made by an agent
+#   merge    Merge an agent's branch
+#   clean    Cleanup completed slots
+#   help     Show help for a command
+
+set -euo pipefail
+
+VERSION="0.2.0"
+BORG_HOME="${BORG_HOME:-$HOME/.borg}"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Shared Utilities
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+DIM='\033[2m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+log_info()    { echo -e "${BLUE}[borg]${NC} $1"; }
+log_success() { echo -e "${GREEN}[borg]${NC} $1"; }
+log_warn()    { echo -e "${YELLOW}[borg]${NC} $1"; }
+log_error()   { echo -e "${RED}[borg]${NC} $1" >&2; }
+
+# JSON parsing (no jq dependency)
+get_json_value() {
+    local file="$1" key="$2"
+    grep -o "\"${key}\": *\"[^\"]*\"" "$file" 2>/dev/null | head -1 | cut -d'"' -f4 || echo ""
+}
+
+get_json_number() {
+    local file="$1" key="$2"
+    grep -o "\"${key}\": *[0-9.]*" "$file" 2>/dev/null | head -1 | grep -oE '[0-9.]+' || echo ""
+}
+
+# Check if borg is initialized
+check_initialized() {
+    if [[ ! -f "${BORG_HOME}/config.json" ]]; then
+        log_error "Workspace not initialized. Run 'borg init' first."
+        exit 1
+    fi
+}
+
+# Check if process is running
+is_running() {
+    local pid="$1"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# Format elapsed time
+format_elapsed() {
+    local start_time="$1"
+    [[ -z "$start_time" ]] && { echo "unknown"; return; }
+
+    local start_epoch
+    if [[ "$(uname)" == "Darwin" ]]; then
+        start_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$start_time" "+%s" 2>/dev/null || echo "")
+    else
+        start_epoch=$(date -d "$start_time" "+%s" 2>/dev/null || echo "")
+    fi
+
+    [[ -z "$start_epoch" ]] && { echo "unknown"; return; }
+
+    local elapsed=$(($(date "+%s") - start_epoch))
+    if [[ $elapsed -lt 60 ]]; then
+        echo "${elapsed}s"
+    elif [[ $elapsed -lt 3600 ]]; then
+        echo "$((elapsed / 60))m $((elapsed % 60))s"
+    else
+        echo "$((elapsed / 3600))h $((elapsed % 3600 / 60))m"
+    fi
+}
+
+# Get cost from log file
+get_cost_from_log() {
+    local log_file="$1"
+    [[ ! -f "$log_file" ]] && { echo ""; return; }
+    # Look for total_cost_usd in the result line
+    grep -o '"total_cost_usd":[0-9.]*' "$log_file" 2>/dev/null | tail -1 | grep -oE '[0-9.]+' || echo ""
+}
+
+# Get changed file count (including untracked)
+get_changed_files_count() {
+    local slot_path="$1" default_branch="$2"
+    if [[ -d "$slot_path/.git" ]]; then
+        local tracked=$(git -C "$slot_path" diff --name-only "origin/${default_branch}" HEAD 2>/dev/null | wc -l | tr -d ' ')
+        local untracked=$(git -C "$slot_path" ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ')
+        echo $((tracked + untracked))
+    else
+        echo "0"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Command: init
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cmd_init() {
+    local repo_url="" local_mode=false
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --local) local_mode=true; shift ;;
+            -h|--help) cmd_help init; return ;;
+            *) repo_url="$1"; shift ;;
+        esac
+    done
+
+    # Auto-detect local mode if repo_url is a local path
+    if [[ -n "$repo_url" && ("$repo_url" == "." || "$repo_url" == ".." || "$repo_url" =~ ^\.?\.?/ || -d "$repo_url/.git") ]]; then
+        local_mode=true
+        # Convert to absolute path if relative
+        if [[ "$repo_url" == "." ]]; then
+            repo_url=""  # Will be set below from git remote
+        fi
+    fi
+
+    if [[ "$local_mode" == true ]]; then
+        if ! git rev-parse --git-dir > /dev/null 2>&1; then
+            log_error "Not in a git repository. Use --local from within a git repo."
+            exit 1
+        fi
+        local local_repo_path=$(git rev-parse --show-toplevel)
+        if [[ -z "$repo_url" ]]; then
+            repo_url=$(git remote get-url origin 2>/dev/null || echo "")
+        fi
+        # If still no remote URL, use local path as repo_url
+        if [[ -z "$repo_url" ]]; then
+            repo_url="$local_repo_path"
+            log_warn "No 'origin' remote found. Using local path."
+        fi
+    elif [[ -z "$repo_url" ]]; then
+        cmd_help init
+        return
+    fi
+
+    log_info "Initializing Borg workspace at ${BORG_HOME}"
+
+    if [[ -f "${BORG_HOME}/config.json" ]]; then
+        log_warn "Borg workspace already exists at ${BORG_HOME}"
+        read -p "Reinitialize? This will NOT delete existing slots. [y/N] " -n 1 -r
+        echo
+        [[ ! $REPLY =~ ^[Yy]$ ]] && { log_info "Aborted."; return; }
+    fi
+
+    log_info "Creating directory structure..."
+    mkdir -p "${BORG_HOME}"/{slots,state,logs}
+
+    local reference_path="${BORG_HOME}/reference.git"
+    if [[ -d "$reference_path" ]]; then
+        log_info "Updating existing reference repository..."
+        git -C "$reference_path" fetch --all --prune
+    else
+        log_info "Cloning reference repository (bare)..."
+        if [[ "$local_mode" == true ]]; then
+            git clone --bare "$local_repo_path" "$reference_path"
+            git -C "$reference_path" remote set-url origin "$repo_url"
+        else
+            git clone --bare "$repo_url" "$reference_path"
+        fi
+    fi
+
+    local default_branch=$(git -C "$reference_path" symbolic-ref --short HEAD 2>/dev/null || echo "main")
+
+    # Store original repo path for pushing branches back
+    local original_repo_path=""
+    if [[ "$local_mode" == true ]]; then
+        original_repo_path="$local_repo_path"
+    fi
+
+    log_info "Writing configuration..."
+    cat > "${BORG_HOME}/config.json" << EOF
+{
+  "repo_url": "${repo_url}",
+  "reference_path": "${reference_path}",
+  "default_branch": "${default_branch}",
+  "original_repo_path": "${original_repo_path}",
+  "initialized_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "version": "${VERSION}"
+}
+EOF
+
+    log_success "Borg workspace initialized!"
+    echo ""
+    echo "  Workspace:  ${BORG_HOME}"
+    echo "  Repository: ${repo_url}"
+    echo "  Branch:     ${default_branch}"
+    echo ""
+    echo "Next: borg spawn <slot> \"<task>\""
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Command: spawn
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cmd_spawn() {
+    local slot_name="" task="" model="sonnet" skip_permissions=true commit_changes=false timeout_secs="" continue_mode=false
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --model) model="$2"; shift 2 ;;
+            --commit) commit_changes=true; shift ;;
+            --timeout) timeout_secs="$2"; shift 2 ;;
+            --continue) continue_mode=true; shift ;;
+            --no-dangerously-skip-permissions) skip_permissions=false; shift ;;
+            -h|--help) cmd_help spawn; return ;;
+            *)
+                if [[ -z "$slot_name" ]]; then slot_name="$1"
+                elif [[ -z "$task" ]]; then task="$1"
+                else log_error "Unexpected argument: $1"; cmd_help spawn; return
+                fi
+                shift ;;
+        esac
+    done
+
+    [[ -z "$slot_name" || -z "$task" ]] && { cmd_help spawn; return; }
+    [[ ! "$slot_name" =~ ^[a-zA-Z0-9_-]+$ ]] && { log_error "Invalid slot name. Use alphanumeric, dash, underscore only."; exit 1; }
+
+    check_initialized
+
+    local repo_url=$(get_json_value "${BORG_HOME}/config.json" "repo_url")
+    local reference_path=$(get_json_value "${BORG_HOME}/config.json" "reference_path")
+    local default_branch=$(get_json_value "${BORG_HOME}/config.json" "default_branch")
+
+    local slot_path="${BORG_HOME}/slots/${slot_name}"
+    local state_file="${BORG_HOME}/state/${slot_name}.json"
+    local log_file="${BORG_HOME}/logs/${slot_name}.log"
+    local branch_name="borg/${slot_name}"
+
+    # Check if slot already exists and is running
+    if [[ -f "$state_file" ]]; then
+        local existing_pid=$(get_json_number "$state_file" "pid")
+        if is_running "$existing_pid"; then
+            log_error "Slot '${slot_name}' is already running (PID: ${existing_pid})"
+            log_info "Use 'borg status' to check or 'borg clean ${slot_name}' to remove."
+            exit 1
+        fi
+        log_warn "Slot '${slot_name}' exists but is not running. Reusing..."
+    fi
+
+    log_info "Spawning agent '${slot_name}'..."
+
+    # Create or reset checkout
+    if [[ -d "$slot_path" ]]; then
+        cd "$slot_path"
+        if [[ "$continue_mode" == true ]]; then
+            # Continue mode: preserve existing work, just ensure we're on the right branch
+            log_info "Continuing on existing checkout..."
+            if git rev-parse --verify "$branch_name" >/dev/null 2>&1; then
+                git checkout "$branch_name" 2>/dev/null || true
+            else
+                log_info "Creating branch '${branch_name}'..."
+                git checkout -b "$branch_name"
+            fi
+        else
+            # Normal mode: reset to clean state
+            log_info "Reusing existing checkout..."
+            git fetch origin
+            git checkout "$default_branch" 2>/dev/null || git checkout -b "$default_branch" "origin/${default_branch}"
+            git reset --hard "origin/${default_branch}"
+            git clean -fd
+            git branch -D "$branch_name" 2>/dev/null || true
+            log_info "Creating branch '${branch_name}'..."
+            git checkout -b "$branch_name"
+        fi
+    else
+        log_info "Creating new checkout (using reference clone)..."
+        git clone --reference "$reference_path" "$repo_url" "$slot_path"
+        cd "$slot_path"
+        log_info "Creating branch '${branch_name}'..."
+        git checkout -b "$branch_name"
+    fi
+
+    # Add original repo as remote for pushing branches back
+    local original_repo_path=$(get_json_value "${BORG_HOME}/config.json" "original_repo_path")
+    if [[ -n "$original_repo_path" && -d "$original_repo_path/.git" ]]; then
+        if ! git remote get-url original &>/dev/null; then
+            git remote add original "$original_repo_path"
+            log_info "Added original repo as remote: ${original_repo_path}"
+        fi
+    fi
+
+    # Prepare task with optional commit instruction
+    local final_task="$task"
+    if [[ "$commit_changes" == true ]]; then
+        final_task="${task}. After completing the task, commit all changes with an appropriate commit message."
+    fi
+
+    # Prepare Claude command
+    local claude_args=(-p "$final_task" --output-format stream-json --verbose)
+    [[ "$skip_permissions" == true ]] && claude_args+=(--dangerously-skip-permissions)
+
+    > "$log_file"
+
+    log_info "Starting Claude (model: ${model})..."
+    log_info "Task: ${task}"
+    [[ "$commit_changes" == true ]] && log_info "Auto-commit: enabled"
+    log_info "Logging to: ${log_file}"
+
+    # Launch Claude (with optional timeout)
+    if [[ -n "$timeout_secs" ]]; then
+        log_info "Timeout: ${timeout_secs}s"
+        nohup timeout "$timeout_secs" claude "${claude_args[@]}" >> "$log_file" 2>&1 &
+    else
+        nohup claude "${claude_args[@]}" >> "$log_file" 2>&1 &
+    fi
+    local claude_pid=$!
+
+    # Write state file
+    cat > "$state_file" << EOF
+{
+  "slot_name": "${slot_name}",
+  "status": "running",
+  "pid": ${claude_pid},
+  "branch": "${branch_name}",
+  "task": $(echo "$task" | sed 's/"/\\"/g' | sed 's/.*/"&"/'),
+  "model": "${model}",
+  "slot_path": "${slot_path}",
+  "log_file": "${log_file}",
+  "commit_mode": ${commit_changes},
+  "started_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+}
+EOF
+
+    log_success "Agent spawned!"
+    echo ""
+    echo "  Slot:    ${slot_name}"
+    echo "  PID:     ${claude_pid}"
+    echo "  Branch:  ${branch_name}"
+    echo ""
+    echo "Next: borg status | borg logs ${slot_name}"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Command: status
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cmd_status() {
+    local specific_slot="" watch_mode=false
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --watch) watch_mode=true; shift ;;
+            -h|--help) cmd_help status; return ;;
+            *) specific_slot="$1"; shift ;;
+        esac
+    done
+
+    check_initialized
+
+    local default_branch=$(get_json_value "${BORG_HOME}/config.json" "default_branch")
+
+    print_slot_status() {
+        local state_file="$1" detailed="${2:-false}"
+        local slot_name=$(get_json_value "$state_file" "slot_name")
+        local status=$(get_json_value "$state_file" "status")
+        local pid=$(get_json_number "$state_file" "pid")
+        local branch=$(get_json_value "$state_file" "branch")
+        local task=$(get_json_value "$state_file" "task")
+        local started_at=$(get_json_value "$state_file" "started_at")
+        local slot_path=$(get_json_value "$state_file" "slot_path")
+        local log_file=$(get_json_value "$state_file" "log_file")
+
+        # Update status based on actual process state
+        local actual_status="$status"
+        if [[ "$status" == "running" ]]; then
+            is_running "$pid" && actual_status="running" || actual_status="complete"
+        fi
+
+        local status_icon status_color
+        case "$actual_status" in
+            running)  status_icon="*"; status_color="$YELLOW" ;;
+            complete) status_icon="x"; status_color="$GREEN" ;;
+            merged)   status_icon="✓"; status_color="$GREEN" ;;
+            error)    status_icon="!"; status_color="$RED" ;;
+            *)        status_icon=" "; status_color="$DIM" ;;
+        esac
+
+        local elapsed=$(format_elapsed "$started_at")
+        local changed_files=$(get_changed_files_count "$slot_path" "$default_branch")
+        local cost=$(get_cost_from_log "$log_file")
+        local cost_str=""
+        [[ -n "$cost" ]] && cost_str="\$${cost}"
+
+        if [[ "$detailed" == "true" ]]; then
+            echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
+            echo -e "${BLUE}Agent:${NC}   ${slot_name}"
+            echo -e "${BLUE}Status:${NC}  ${status_color}${actual_status}${NC}"
+            echo -e "${BLUE}PID:${NC}     ${pid:-N/A}"
+            echo -e "${BLUE}Branch:${NC}  ${branch}"
+            echo -e "${BLUE}Runtime:${NC} ${elapsed}"
+            echo -e "${BLUE}Files:${NC}   ${changed_files} changed"
+            [[ -n "$cost" ]] && echo -e "${BLUE}Cost:${NC}    \$${cost}"
+            echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
+            echo -e "${BLUE}Task:${NC}"
+            echo -e "  ${task}"
+            echo ""
+            echo -e "${BLUE}Log (last 10 lines):${NC}"
+            if [[ -f "$log_file" ]]; then
+                tail -10 "$log_file" 2>/dev/null | while read -r line; do
+                    echo -e "  ${DIM}${line:0:100}${NC}"
+                done
+            else
+                echo -e "  ${DIM}No log file found${NC}"
+            fi
+        else
+            local cost_display=""
+            [[ -n "$cost" ]] && cost_display=" \$${cost}"
+            printf "  [${status_color}%s${NC}] %-12s ${DIM}%-8s${NC} %2s files${cost_display}  %s\n" \
+                "$status_icon" "$slot_name" "($elapsed)" "$changed_files" "${task:0:35}"
+        fi
+    }
+
+    show_status() {
+        if [[ -n "$specific_slot" ]]; then
+            local state_file="${BORG_HOME}/state/${specific_slot}.json"
+            [[ ! -f "$state_file" ]] && { log_error "Slot '${specific_slot}' not found."; exit 1; }
+            print_slot_status "$state_file" "true"
+        else
+            echo -e "${CYAN}╔═══════════════════════════════════════════════════════╗${NC}"
+            echo -e "${CYAN}║${NC}  ${BOLD}BORG${NC} - Multi-Agent Checkout                         ${CYAN}║${NC}"
+            echo -e "${CYAN}╚═══════════════════════════════════════════════════════╝${NC}"
+            echo ""
+
+            local state_files=("${BORG_HOME}"/state/*.json)
+            if [[ ! -e "${state_files[0]}" ]]; then
+                echo -e "  ${DIM}No agents found. Use 'borg spawn' to create one.${NC}"
+            else
+                echo -e "  ${DIM}[*] running  [x] complete  [✓] merged${NC}"
+                echo ""
+                for state_file in "${state_files[@]}"; do
+                    [[ -f "$state_file" ]] && print_slot_status "$state_file" "false"
+                done
+            fi
+            echo ""
+        fi
+    }
+
+    if [[ "$watch_mode" == true ]]; then
+        while true; do
+            clear
+            show_status
+            echo -e "${DIM}Refreshing every 2s. Ctrl+C to exit.${NC}"
+            sleep 2
+        done
+    else
+        show_status
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Command: logs
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cmd_logs() {
+    local slot_name="" follow=true lines=50 pretty=false
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -f|--follow) follow=true; shift ;;
+            --no-follow) follow=false; shift ;;
+            -n|--lines) lines="$2"; shift 2 ;;
+            --pretty) pretty=true; follow=false; shift ;;
+            -h|--help) cmd_help logs; return ;;
+            *)
+                [[ -z "$slot_name" ]] && slot_name="$1" || { log_error "Unexpected: $1"; return; }
+                shift ;;
+        esac
+    done
+
+    [[ -z "$slot_name" ]] && { cmd_help logs; return; }
+    check_initialized
+
+    local state_file="${BORG_HOME}/state/${slot_name}.json"
+    [[ ! -f "$state_file" ]] && { log_error "Slot '${slot_name}' not found."; exit 1; }
+
+    local log_file="${BORG_HOME}/logs/${slot_name}.log"
+    [[ ! -f "$log_file" ]] && { log_error "Log file not found."; exit 1; }
+
+    log_info "Logs for '${slot_name}'"
+    echo ""
+
+    if [[ "$pretty" == true ]]; then
+        # Parse JSON logs into readable format
+        tail -n "$lines" "$log_file" | while read -r line; do
+            local type=$(echo "$line" | grep -o '"type":"[^"]*"' | cut -d'"' -f4)
+            local subtype=$(echo "$line" | grep -o '"subtype":"[^"]*"' | cut -d'"' -f4)
+
+            case "$type" in
+                assistant)
+                    local text=$(echo "$line" | grep -o '"text":"[^"]*"' | head -1 | cut -d'"' -f4)
+                    [[ -n "$text" ]] && echo -e "${BLUE}►${NC} ${text:0:100}"
+
+                    local tool=$(echo "$line" | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4)
+                    [[ -n "$tool" ]] && echo -e "${DIM}  → Using: ${tool}${NC}"
+                    ;;
+                result)
+                    local result=$(echo "$line" | grep -o '"result":"[^"]*"' | cut -d'"' -f4)
+                    local cost=$(echo "$line" | grep -o '"total_cost_usd":[0-9.]*' | grep -oE '[0-9.]+')
+                    echo -e "${GREEN}✓${NC} ${result:0:80}"
+                    [[ -n "$cost" ]] && echo -e "${DIM}  Cost: \$${cost}${NC}"
+                    ;;
+                user)
+                    local content=$(echo "$line" | grep -o '"content":"[^"]*"' | head -1 | cut -d'"' -f4)
+                    [[ -n "$content" ]] && echo -e "${DIM}  ← ${content:0:60}${NC}"
+                    ;;
+            esac
+        done
+    elif [[ "$follow" == true ]]; then
+        tail -n "$lines" -f "$log_file"
+    else
+        tail -n "$lines" "$log_file"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Command: diff
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cmd_diff() {
+    local slot_name="" diff_mode=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --stat) diff_mode="--stat"; shift ;;
+            --name-only) diff_mode="--name-only"; shift ;;
+            -h|--help) cmd_help diff; return ;;
+            *)
+                [[ -z "$slot_name" ]] && slot_name="$1" || { log_error "Unexpected: $1"; return; }
+                shift ;;
+        esac
+    done
+
+    [[ -z "$slot_name" ]] && { cmd_help diff; return; }
+    check_initialized
+
+    local state_file="${BORG_HOME}/state/${slot_name}.json"
+    [[ ! -f "$state_file" ]] && { log_error "Slot '${slot_name}' not found."; exit 1; }
+
+    local slot_path=$(get_json_value "$state_file" "slot_path")
+    local branch=$(get_json_value "$state_file" "branch")
+    local default_branch=$(get_json_value "${BORG_HOME}/config.json" "default_branch")
+
+    [[ ! -d "$slot_path" ]] && { log_error "Slot directory not found."; exit 1; }
+
+    echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}Agent:${NC}  ${slot_name}"
+    echo -e "${BLUE}Branch:${NC} ${branch}"
+    echo -e "${BLUE}Diff:${NC}   origin/${default_branch}...HEAD"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    cd "$slot_path"
+    local untracked=$(git ls-files --others --exclude-standard)
+
+    if [[ -n "$diff_mode" ]]; then
+        git diff "origin/${default_branch}"...HEAD $diff_mode
+    else
+        git diff "origin/${default_branch}"...HEAD --color=always
+    fi
+
+    if [[ -n "$untracked" ]]; then
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+        echo -e "${BLUE}New files (untracked):${NC}"
+        echo "$untracked" | while read -r file; do
+            echo -e "  ${GREEN}+ ${file}${NC}"
+            if [[ -f "$file" ]]; then
+                echo -e "${DIM}$(head -20 "$file" | sed 's/^/    /')${NC}"
+                local total_lines=$(wc -l < "$file" | tr -d ' ')
+                [[ $total_lines -gt 20 ]] && echo -e "    ${DIM}... (${total_lines} lines total)${NC}"
+            fi
+        done
+    fi
+
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+    local changed=$(git diff --name-only "origin/${default_branch}"...HEAD | wc -l | tr -d ' ')
+    local untracked_count=$(echo "$untracked" | grep -c . 2>/dev/null || echo "0")
+    echo -e "${DIM}${changed} modified, ${untracked_count} new files${NC}"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Command: merge
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cmd_merge() {
+    local slot_name="" mode="auto" squash=false delete_after=false dry_run=false
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --pr) mode="pr"; shift ;;
+            --local) mode="local"; shift ;;
+            --squash) squash=true; shift ;;
+            --delete) delete_after=true; shift ;;
+            --dry-run) dry_run=true; shift ;;
+            -h|--help) cmd_help merge; return ;;
+            *)
+                [[ -z "$slot_name" ]] && slot_name="$1" || { log_error "Unexpected: $1"; return; }
+                shift ;;
+        esac
+    done
+
+    [[ -z "$slot_name" ]] && { cmd_help merge; return; }
+    check_initialized
+
+    local state_file="${BORG_HOME}/state/${slot_name}.json"
+    [[ ! -f "$state_file" ]] && { log_error "Slot '${slot_name}' not found."; exit 1; }
+
+    local slot_path=$(get_json_value "$state_file" "slot_path")
+    local branch=$(get_json_value "$state_file" "branch")
+    local task=$(get_json_value "$state_file" "task")
+    local pid=$(get_json_number "$state_file" "pid")
+    local default_branch=$(get_json_value "${BORG_HOME}/config.json" "default_branch")
+
+    if is_running "$pid"; then
+        log_warn "Agent '${slot_name}' is still running (PID: ${pid})"
+        read -p "Proceed anyway? [y/N] " -n 1 -r
+        echo
+        [[ ! $REPLY =~ ^[Yy]$ ]] && { log_info "Aborted."; return; }
+    fi
+
+    cd "$slot_path"
+    local changed=$(git diff --name-only "origin/${default_branch}"...HEAD | wc -l | tr -d ' ')
+    local untracked=$(git ls-files --others --exclude-standard | wc -l | tr -d ' ')
+    local total_changes=$((changed + untracked))
+
+    [[ "$total_changes" -eq 0 ]] && { log_warn "No changes to merge."; return; }
+
+    log_info "Preparing to merge '${branch}'..."
+    echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}Slot:${NC}    ${slot_name}"
+    echo -e "${BLUE}Branch:${NC}  ${branch}"
+    echo -e "${BLUE}Files:${NC}   ${total_changes} changed"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+
+    [[ "$mode" == "auto" ]] && { command -v gh &>/dev/null && mode="pr" || mode="local"; }
+
+    if [[ "$dry_run" == true ]]; then
+        log_info "[DRY RUN] Would:"
+        [[ "$mode" == "pr" ]] && echo "  1. Push branch and create PR" || echo "  1. Merge locally"
+        [[ "$delete_after" == true ]] && echo "  2. Delete slot '${slot_name}'"
+        return
+    fi
+
+    # Stage untracked files if any
+    if [[ "$untracked" -gt 0 ]]; then
+        log_info "Staging untracked files..."
+        git add -A
+        git commit -m "borg: ${task:0:50}" || true
+    fi
+
+    if [[ "$mode" == "pr" ]]; then
+        log_info "Pushing branch to origin..."
+        git push -u origin "$branch"
+
+        log_info "Creating pull request..."
+        local pr_url=$(gh pr create --title "${task:0:72}" --body "## Task
+${task}
+
+---
+*Generated by Borg*" --head "$branch" --base "$default_branch" 2>&1)
+
+        log_success "Pull request created!"
+        echo "  ${pr_url}"
+    else
+        log_info "Merging locally..."
+        git fetch origin "$default_branch"
+        git checkout "$default_branch"
+        git pull origin "$default_branch"
+
+        if [[ "$squash" == true ]]; then
+            git merge --squash "$branch"
+            git commit -m "$task"
+        else
+            git merge "$branch" -m "Merge ${branch}: ${task:0:50}"
+        fi
+
+        log_success "Merged! Push with: git push origin ${default_branch}"
+    fi
+
+    sed -i.bak 's/"status": *"[^"]*"/"status": "merged"/' "$state_file" && rm -f "${state_file}.bak"
+
+    [[ "$delete_after" == true ]] && cmd_clean "$slot_name" --force
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Command: clean
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cmd_clean() {
+    local slot_name="" clean_all=false clean_completed=false force=false
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --all) clean_all=true; shift ;;
+            --completed) clean_completed=true; shift ;;
+            --force|-f) force=true; shift ;;
+            -h|--help) cmd_help clean; return ;;
+            *)
+                [[ -z "$slot_name" ]] && slot_name="$1" || { log_error "Unexpected: $1"; return; }
+                shift ;;
+        esac
+    done
+
+    check_initialized
+
+    clean_single_slot() {
+        local name="$1" force_clean="${2:-false}"
+        local state_file="${BORG_HOME}/state/${name}.json"
+        local log_file="${BORG_HOME}/logs/${name}.log"
+
+        [[ ! -f "$state_file" ]] && { log_error "Slot '${name}' not found."; return 1; }
+
+        local slot_path=$(get_json_value "$state_file" "slot_path")
+        local pid=$(get_json_number "$state_file" "pid")
+
+        if is_running "$pid"; then
+            if [[ "$force_clean" != "true" ]]; then
+                log_warn "Agent '${name}' is still running (PID: ${pid})"
+                read -p "Kill and clean? [y/N] " -n 1 -r
+                echo
+                [[ ! $REPLY =~ ^[Yy]$ ]] && { log_info "Skipping."; return 0; }
+            fi
+            log_info "Killing process ${pid}..."
+            kill "$pid" 2>/dev/null || true
+            sleep 1
+        fi
+
+        log_info "Cleaning slot '${name}'..."
+        [[ -d "$slot_path" ]] && { rm -rf "$slot_path"; echo -e "  ${DIM}Removed: ${slot_path}${NC}"; }
+        [[ -f "$state_file" ]] && { rm -f "$state_file"; echo -e "  ${DIM}Removed: ${state_file}${NC}"; }
+        [[ -f "$log_file" ]] && { rm -f "$log_file"; echo -e "  ${DIM}Removed: ${log_file}${NC}"; }
+        log_success "Cleaned '${name}'"
+    }
+
+    if [[ -n "$slot_name" ]]; then
+        clean_single_slot "$slot_name" "$force"
+    elif [[ "$clean_all" == true ]]; then
+        local state_files=("${BORG_HOME}"/state/*.json)
+        [[ ! -e "${state_files[0]}" ]] && { log_info "No slots to clean."; return; }
+
+        if [[ "$force" != "true" ]]; then
+            local count=$(ls -1 "${BORG_HOME}/state/"*.json 2>/dev/null | wc -l | tr -d ' ')
+            log_warn "This will remove ${count} slot(s)."
+            read -p "Continue? [y/N] " -n 1 -r
+            echo
+            [[ ! $REPLY =~ ^[Yy]$ ]] && { log_info "Aborted."; return; }
+        fi
+
+        for sf in "${state_files[@]}"; do
+            [[ -f "$sf" ]] && clean_single_slot "$(basename "$sf" .json)" "true"
+        done
+    elif [[ "$clean_completed" == true ]]; then
+        local state_files=("${BORG_HOME}"/state/*.json)
+        [[ ! -e "${state_files[0]}" ]] && { log_info "No slots to clean."; return; }
+
+        local cleaned=0
+        for sf in "${state_files[@]}"; do
+            if [[ -f "$sf" ]]; then
+                local pid=$(get_json_number "$sf" "pid")
+                is_running "$pid" && continue
+                clean_single_slot "$(basename "$sf" .json)" "true"
+                ((cleaned++))
+            fi
+        done
+        [[ $cleaned -eq 0 ]] && log_info "No completed slots to clean."
+    else
+        echo -e "${BLUE}[borg]${NC} Slots that can be cleaned:"
+        echo ""
+
+        local state_files=("${BORG_HOME}"/state/*.json)
+        if [[ ! -e "${state_files[0]}" ]]; then
+            echo -e "  ${DIM}No slots found.${NC}"
+            return
+        fi
+
+        for sf in "${state_files[@]}"; do
+            if [[ -f "$sf" ]]; then
+                local name=$(basename "$sf" .json)
+                local pid=$(get_json_number "$sf" "pid")
+                if is_running "$pid"; then
+                    echo -e "  ${YELLOW}[running]${NC}  ${name}"
+                else
+                    echo -e "  ${GREEN}[complete]${NC} ${name}"
+                fi
+            fi
+        done
+
+        echo ""
+        echo "Use: borg clean <slot> | --completed | --all"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Command: help
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cmd_help() {
+    local command="${1:-}"
+
+    case "$command" in
+        init)
+            echo "Usage: borg init [--local | <repo-url>]"
+            echo ""
+            echo "Initialize the Borg workspace."
+            echo ""
+            echo "Options:"
+            echo "  --local       Use current git repo's origin"
+            echo "  <repo-url>    Remote repository URL"
+            ;;
+        spawn)
+            echo "Usage: borg spawn <slot> \"<task>\" [options]"
+            echo ""
+            echo "Spawn an agent in an isolated checkout."
+            echo ""
+            echo "Options:"
+            echo "  --commit      Auto-commit changes when done"
+            echo "  --timeout N   Kill agent after N seconds"
+            echo "  --model M     Claude model (default: sonnet)"
+            ;;
+        status)
+            echo "Usage: borg status [slot] [--watch]"
+            echo ""
+            echo "Show status of agents."
+            echo ""
+            echo "Options:"
+            echo "  <slot>    Show detailed status for one agent"
+            echo "  --watch   Continuously refresh status"
+            ;;
+        logs)
+            echo "Usage: borg logs <slot> [options]"
+            echo ""
+            echo "View agent logs."
+            echo ""
+            echo "Options:"
+            echo "  --pretty      Parse JSON into readable format"
+            echo "  --no-follow   Don't follow (show and exit)"
+            echo "  -n N          Show last N lines (default: 50)"
+            ;;
+        diff)
+            echo "Usage: borg diff <slot> [--stat | --name-only]"
+            echo ""
+            echo "Show changes made by an agent."
+            ;;
+        merge)
+            echo "Usage: borg merge <slot> [options]"
+            echo ""
+            echo "Merge an agent's branch."
+            echo ""
+            echo "Options:"
+            echo "  --pr        Create pull request (default if gh available)"
+            echo "  --local     Merge locally"
+            echo "  --squash    Squash commits"
+            echo "  --delete    Delete slot after merge"
+            echo "  --dry-run   Show what would happen"
+            ;;
+        clean)
+            echo "Usage: borg clean [slot] [--completed | --all] [--force]"
+            echo ""
+            echo "Cleanup agent slots."
+            echo ""
+            echo "Options:"
+            echo "  <slot>       Clean specific slot"
+            echo "  --completed  Clean all finished agents"
+            echo "  --all        Clean everything"
+            echo "  --force      Skip confirmation"
+            ;;
+        *)
+            echo -e "${BOLD}borg${NC} - Multi-Agent Checkout System v${VERSION}"
+            echo ""
+            echo "Usage: borg <command> [options]"
+            echo ""
+            echo "Commands:"
+            echo "  init     Initialize workspace"
+            echo "  spawn    Spawn an agent"
+            echo "  status   Show agent status"
+            echo "  logs     View agent logs"
+            echo "  diff     Show agent changes"
+            echo "  merge    Merge agent branch"
+            echo "  clean    Cleanup slots"
+            echo "  help     Show help"
+            echo ""
+            echo "Run 'borg help <command>' for command details."
+            echo ""
+            echo "Environment:"
+            echo "  BORG_HOME    Workspace location (default: ~/.borg)"
+            ;;
+    esac
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main Router
+# ═══════════════════════════════════════════════════════════════════════════════
+
+main() {
+    local command="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "$command" in
+        init)   cmd_init "$@" ;;
+        spawn)  cmd_spawn "$@" ;;
+        status) cmd_status "$@" ;;
+        logs)   cmd_logs "$@" ;;
+        diff)   cmd_diff "$@" ;;
+        merge)  cmd_merge "$@" ;;
+        clean)  cmd_clean "$@" ;;
+        help|--help|-h) cmd_help "$@" ;;
+        --version|-v) echo "borg v${VERSION}" ;;
+        *) log_error "Unknown command: $command"; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"

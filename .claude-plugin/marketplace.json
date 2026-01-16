@@ -1,0 +1,15 @@
+{
+  "name": "ralph-borg",
+  "owner": {
+    "name": "kiitsun-e",
+    "url": "https://github.com/kiitsun-e/ralph-borg"
+  },
+  "plugins": [
+    {
+      "name": "ralph-borg",
+      "source": "..",
+      "description": "Spec-driven development with parallel agent orchestration",
+      "version": "0.1.0"
+    }
+  ]
+}
