@@ -15,6 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BORG_HOME="${BORG_HOME:-$HOME/.borg}"
+BORG_PHASE_TIMEOUT="${BORG_PHASE_TIMEOUT:-600}"
 
 # Colors
 RED='\033[0;31m'
@@ -260,7 +261,7 @@ Begin by reading the implementation plan, pick 2-3 tasks, complete them, commit,
 
         # Wait for completion
         log_info "Waiting for Phase ${phase_num} to complete..."
-        wait_for_completion "$slot_name" 600
+        wait_for_completion "$slot_name" "$BORG_PHASE_TIMEOUT"
 
         # Get cost from this iteration
         local log_file="${BORG_HOME}/logs/${slot_name}.log"
@@ -270,10 +271,15 @@ Begin by reading the implementation plan, pick 2-3 tasks, complete them, commit,
             log_info "Phase ${phase_num} cost: \$${phase_cost}"
         fi
 
-        # Sync implementation plan back to original repo for visibility
-        if [[ -f "$slot_impl_plan" && -n "$original_repo_root" ]]; then
-            cp "$slot_impl_plan" "$impl_plan"
-            log_info "Synced progress back to original repo"
+        # Push branch to original repo after each phase for visibility
+        # (The feature branch is the source of truth for both code AND spec progress)
+        local slot_path="${BORG_HOME}/slots/${slot_name}"
+        local branch_name="borg/${slot_name}"
+        if [[ -d "$slot_path/.git" ]]; then
+            if cd "$slot_path" && git push origin "${branch_name}:${branch_name}" 2>/dev/null; then
+                log_info "Pushed branch '${branch_name}' to original repo"
+            fi
+            cd - >/dev/null 2>&1 || true
         fi
 
         # Check if checkboxes were updated - use slot's copy

@@ -1,6 +1,6 @@
 {
   "name": "ralph-borg",
-  "version": "0.2.0",
+  "version": "0.2.3",
   "description": "Spec-driven development with parallel agent orchestration",
   "author": {
     "name": "kiitsun-e"
