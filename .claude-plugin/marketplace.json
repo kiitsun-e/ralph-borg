@@ -7,7 +7,7 @@
   "plugins": [
     {
       "name": "ralph-borg",
-      "source": "..",
+      "source": ".",
       "description": "Spec-driven development with parallel agent orchestration",
       "version": "0.1.0"
     }
