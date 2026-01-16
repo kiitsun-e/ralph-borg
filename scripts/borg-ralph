@@ -218,22 +218,23 @@ cmd_loop() {
 ## Your Task
 
 1. Read the implementation plan to see what's incomplete ([ ] checkboxes)
-2. Pick a reasonable chunk of work you can complete WITHOUT filling your context
-   - Don't try to do everything at once
-   - Better to do 2-3 tasks well than rush through many
+2. Pick **exactly 2-3 tasks** to complete - NO MORE
+   - This is a HARD LIMIT, not a suggestion
+   - Another agent will continue after you
 3. Do the work, referencing the feature spec for requirements
 4. Update each checkbox from [ ] to [x] as you complete it
 5. Commit your changes with a descriptive message
-6. Exit when you've completed your chunk (another agent will continue)
+6. **EXIT IMMEDIATELY** after completing your 2-3 tasks
 
 ## Rules
+- **STOP after 2-3 tasks** - do not continue even if you have capacity
 - Update checkboxes IMMEDIATELY as you complete each task
-- Commit after completing your chunk of work
-- Don't try to do too much - stay well under context limits
+- Commit after completing your tasks
 - Reference the feature spec for detailed requirements
 - If unclear, check SPEC.md for broader context
+- Trust that another agent will pick up remaining work
 
-Begin by reading the implementation plan to see what needs to be done."
+Begin by reading the implementation plan, pick 2-3 tasks, complete them, commit, and exit."
 
         # Clean previous run if exists
         if [[ -f "${BORG_HOME}/state/${slot_name}.json" ]]; then
